@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveAnyClass, GADTs #-}
 
 import Data.List (singleton)
 import Data.ByteString.Lazy (ByteString)
@@ -12,14 +12,35 @@ import System.IO (hClose)
 
 data Command a b where
   PureCommand :: (a -> IO b) -> Command a b
-  ShellCommand :: ShellCommand a b -> Command a b
+  ShellCommand :: String -> Command ByteString ByteString
   Pipe :: Command a c -> Command c b -> Command a b
 
-data ShellCommand a b = MkShellCommand
-  { shellCommandLine :: String
-  , shellCommandInputAdaptor :: a -> ByteString
-  , shellCommandOutputAdaptor :: ByteString -> b
-  }
+data CommandError = CommandError ByteString
+  deriving (Show, Exception)
+
+runCommand :: Command a b -> a -> IO b
+runCommand (PureCommand f) a = f a
+runCommand (ShellCommand cmd) a = do
+  (Just stdin, Just stdout, Just stderr, _) <- Process.createProcess (Process.shell cmd)
+    { Process.std_in = Process.CreatePipe, Process.std_out = Process.CreatePipe, Process.std_err = Process.CreatePipe }
+  forkIO $ ByteString.hPut stdin a >> hClose stdin
+  err <- ByteString.hGetContents stderr
+  out <- ByteString.hGetContents stdout
+  forkIO . when (ByteString.length err /= 0) . throwIO . CommandError $ err
+  pure out
+runCommand (Pipe x y) a = runCommand x a >>= runCommand y
+
+instance Functor (Command a) where
+  fmap f (PureCommand g) = PureCommand (fmap f <$> g)
+  fmap f c@(ShellCommand _) = c `Pipe` PureCommand (pure . f)
+  fmap f (x `Pipe` y) = x `Pipe` fmap f y
+
+instance Applicative (Command a) where
+  pure a = PureCommand (pure . const a)
+  f <*> a = PureCommand $ (<*>) <$> runCommand f <*> runCommand a
+
+instance Monad (Command a) where
+  m >>= f = PureCommand $ \i -> runCommand m i >>= flip runCommand i . f
 
 class Adaptable a b where
   adapt :: a -> b
@@ -45,6 +66,9 @@ instance Adaptable ByteString () where
 instance Adaptable () ByteString where
   adapt = const ByteString.empty
 
+class CommandShow a where
+  commandShow :: a -> String
+
 (.|) :: Adaptable b c => Command a b -> Command c d -> Command a d
 (.|) x y = x `Pipe` PureCommand (pure . adapt) `Pipe` y
 
@@ -61,25 +85,15 @@ x .> path = x .| writeTo path
 x .< path = readFrom path .| x
 
 shell :: String -> Command ByteString ByteString
-shell cmd = ShellCommand $ MkShellCommand cmd id id
+shell = ShellCommand
+
+hs :: (a -> IO b) -> Command a b
+hs = PureCommand
 
 retcode :: String -> Command ByteString Int
-retcode cmd = ShellCommand $ MkShellCommand ("{ " ++ cmd ++ "; } > /dev/null; echo $?") id (read . ByteString.toString)
-
-data CommandError = CommandError ByteString
-  deriving (Show, Exception)
-
-runCommand :: Command a b -> a -> IO b
-runCommand (PureCommand f) a = f a
-runCommand (ShellCommand (MkShellCommand cmd input output)) a = do
-  (Just stdin, Just stdout, Just stderr, _) <- Process.createProcess (Process.shell cmd)
-    { Process.std_in = Process.CreatePipe, Process.std_out = Process.CreatePipe, Process.std_err = Process.CreatePipe }
-  forkIO $ ByteString.hPut stdin (input a) >> hClose stdin
-  err <- ByteString.hGetContents stderr
-  out <- output <$> ByteString.hGetContents stdout
-  forkIO . when (ByteString.length err /= 0) . throwIO . CommandError $ err
-  pure out
-runCommand (Pipe x y) a = runCommand x a >>= runCommand y
+retcode cmd = ShellCommand ("{ " ++ cmd ++ "; } > /dev/null; echo $?") .| hs (pure . read . ByteString.toString)
 
 (.$) :: Adaptable c a => Command a b -> c -> IO b
 f .$ a = runCommand f (adapt a)
+
+
