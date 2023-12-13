@@ -1,14 +1,19 @@
 {-# LANGUAGE DeriveAnyClass, GADTs #-}
 
-import Data.List (singleton)
+import Control.Concurrent (forkIO)
+import Control.Exception (Exception, throwIO)
+import Control.Monad (when)
 import Data.ByteString.Lazy (ByteString)
-import qualified Data.ByteString.Lazy.UTF8 as ByteString hiding (length)
+import Data.List (singleton)
+import Data.Ratio (numerator, denominator)
 import qualified Data.ByteString.Lazy as ByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString (unlines, putStrLn)
+import qualified Data.ByteString.Lazy.UTF8 as ByteString hiding (length)
+import qualified System.Posix.Directory as Unix
+import qualified System.Posix.Files as Unix
+import qualified System.Posix.Types as Unix
+import qualified System.Posix.User as Unix
 import qualified System.Process as Process
-import Control.Exception (Exception, throwIO)
-import Control.Concurrent (forkIO)
-import Control.Monad (when)
 import System.IO (hClose)
 
 infix 2 .$
@@ -115,6 +120,52 @@ retcode cmd = ShellCommand ("{ " ++ cmd ++ "; } > /dev/null; echo $?") .| hs (pu
 (.$) :: (Adaptable c a, ToScreen b) => Command a b -> c -> IO ()
 f .$ a = ByteString.putStrLn =<< toScreen <$> runCommand f (adapt a)
 
--- data FileSpec = FileSpec
---   { fileName :: String
---   , file
+data FileSpec = FileSpec
+  { fileName :: String
+  , fileOwner :: User
+  , fileGroup :: Group
+  , fileSize :: Int
+  , fileMTime :: Int
+  }
+
+data User = User
+  { userID :: Int
+  , userName :: String
+  }
+
+data Group = Group
+  { groupID :: Int
+  , groupName :: String
+  }
+
+getUser :: Unix.UserID -> IO User
+getUser id = (User (fromIntegral id) . Unix.userName <$>) . Unix.getUserEntryForID $ id
+
+getGroup :: Unix.GroupID -> IO Group
+getGroup id = (Group (fromIntegral id) . Unix.groupName <$>) . Unix.getGroupEntryForID $ id
+
+getFileSpec :: FilePath -> IO FileSpec
+getFileSpec path = do
+  stat <- Unix.getFileStatus path
+  owner <- getUser . Unix.fileOwner $ stat
+  group <- getGroup . Unix.fileGroup $ stat
+  let size = fromIntegral . Unix.fileSize $ stat
+      mtime = fromIntegral . trunc . toRational . Unix.modificationTime $ stat
+  pure $ FileSpec path owner group size mtime
+  where trunc a = numerator a `div` denominator a
+
+instance ToScreen FileSpec where
+  toScreen fs = ByteString.fromString $
+    userName (fileOwner fs) ++ " " ++ groupName (fileGroup fs) ++ " " ++ show (fileSize fs) ++ " " ++ show (fileMTime fs) ++ " " ++ fileName fs
+
+instance Adaptable FileSpec ByteString where
+  adapt = toScreen
+
+ls :: FilePath -> Command () [FileSpec]
+ls path = hs $ \() -> Unix.openDirStream path >>= getDirContent >>= traverse getFileSpec
+  where
+    getDirContent s = do
+      p <- Unix.readDirStream s
+      if null p
+        then pure []
+        else getDirContent s >>= pure . (p :)
