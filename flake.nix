@@ -11,7 +11,7 @@
             version = "0.1.0";
             src = ./.;
             buildInputs = [ (haskellPackages.ghcWithPackages (p: with p; [
-              process bytestring utf8-string
+              process bytestring utf8-string unix
             ]) ) ];
             buildPhase = ''
               runHook preBuild
